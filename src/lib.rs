@@ -2,8 +2,9 @@ use std::io::{BufRead, Read};
 
 use thiserror::Error;
 
-/// Errors that can be returned by [[bed_map()]].
+/// Errors that can be returned by [bed_map()].
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum BedMapError {
     #[error("failed to read range")]
     RangeRead(#[source] std::io::Error),
@@ -13,6 +14,8 @@ pub enum BedMapError {
     RangeFormat,
     #[error("failed to read target")]
     TargetRead(#[source] std::io::Error),
+    #[error("range out of order")]
+    RangeOrder,
 }
 
 fn parse_range(range: &str) -> Result<(usize, usize), BedMapError> {
@@ -24,7 +27,7 @@ fn parse_range(range: &str) -> Result<(usize, usize), BedMapError> {
 
     let parse = |s: &str| s.parse().map_err(BedMapError::RangeParse);
     let start = parse(fields[0])?;
-    let end = if fields.len() > 1  {
+    let end = if fields.len() > 1 {
         if fields[1].is_empty() {
             return Err(BedMapError::RangeFormat);
         }
@@ -57,9 +60,11 @@ fn test_parse_range() {
 Given a `ranges_source` and a `lines_source`, return an
 iterator that produces the lines selected by the ranges.
 
-Ranges are of the form "#-#" or "#", where `#` is a
-positive integer. The start of a range can be no greater
-than the end; a "#" range selects a single line.
+Ranges are of the form "#-#" or "#", where `#` is a positive
+integer. The start of a range can be no greater than the
+end; a "#" range selects a single line. Ranges must be
+strictly increasing: the start of a range must be greater
+than or equal to the end of the previous range.
 */
 pub fn bed_map<T, U>(
     ranges_source: T,
@@ -80,6 +85,7 @@ where
 
     let mut cur_range = None;
     let mut cur_line: Option<(usize, String)> = None;
+    let mut last_range_end = 0;
 
     macro_rules! try_some {
         ($v:expr, $m:expr) => {
@@ -102,11 +108,18 @@ where
         if cur_range.is_none() {
             let r = try_some!(ranges.next(), BedMapError::RangeRead)?;
             cur_range = try_some!(Some(parse_range(&r)));
+            let (start, end) = cur_range.unwrap();
+            if start < last_range_end {
+                return Some(Err(BedMapError::RangeOrder));
+            }
+            last_range_end = end;
         }
+        let (start, end) = cur_range.unwrap();
+
         if cur_line.is_none() {
             cur_line = Some(try_some!(targets.next(), BedMapError::TargetRead)?);
         }
-        let (start, end) = cur_range.unwrap();
+
         let nline = cur_line.as_ref().unwrap().0;
         if nline >= end {
             cur_range = None;
@@ -125,9 +138,20 @@ fn test_bed_map() {
     use std::io::Cursor as C;
     let ranges = C::new("2\n4-6\n8\n".to_string());
     let lines = C::new("a\nb\nc\nd\ne\nf\ng\nh\n".to_string());
-    let selected: Vec<String> = bed_map(ranges, lines)
+    let selected = bed_map(ranges, lines)
         .collect::<Result<Vec<String>, BedMapError>>()
         .unwrap();
     let expected = ["b", "d", "e", "f", "h"].map(str::to_string);
     assert_eq!(selected, expected);
+}
+
+#[test]
+#[should_panic]
+fn test_bed_map_out_of_order() {
+    use std::io::Cursor as C;
+    let ranges = C::new("2\n4-6\n3\n".to_string());
+    let lines = C::new("a\nb\nc\nd\ne\nf\ng\nh\n".to_string());
+    let _ = bed_map(ranges, lines)
+        .collect::<Result<Vec<String>, BedMapError>>()
+        .unwrap();
 }
